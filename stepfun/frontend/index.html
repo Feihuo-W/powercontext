@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mini 知识库 · 端侧推理 + seekdb 混合检索</title>
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body>
+  <header>
+    <h1>📚 Mini 知识库</h1>
+    <p class="subtitle">浏览器本地 Embedding（Transformers.js · INT8 · WebGPU/WASM）+ seekdb 混合检索</p>
+    <div id="env-banner" class="banner"></div>
+  </header>
+
+  <main>
+    <section class="card" id="model-card">
+      <h2>① 端侧模型</h2>
+      <div class="row">
+        <span class="label">模型</span><code>Xenova/all-MiniLM-L6-v2</code>
+        <span class="label">量化</span><code>INT8 (q8)</code>
+        <span class="label">维度</span><code id="dim-label">384</code>
+      </div>
+      <div class="row">
+        <span class="label">推理后端</span><code id="backend-label">未加载</code>
+        <span class="label">模型源</span>
+        <select id="hf-host">
+          <option value="https://hf-mirror.com">hf-mirror.com（国内镜像）</option>
+          <option value="https://huggingface.co">huggingface.co</option>
+        </select>
+      </div>
+      <button id="load-model-btn">加载模型到浏览器</button>
+      <div id="model-progress" class="progress hidden"><div class="bar"></div></div>
+      <div id="model-status" class="status"></div>
+    </section>
+
+    <section class="card">
+      <h2>② 导入语料</h2>
+      <p class="hint">粘贴文本（空行分段 = 多个文档），或拖入 .txt / .md 文件。向量在本页计算，随原文一起写入 seekdb。</p>
+      <textarea id="corpus" rows="8" placeholder="第一段文档…
+
+第二段文档…"></textarea>
+      <div class="row">
+        <input type="file" id="file-input" accept=".txt,.md,text/plain" multiple />
+        <button id="ingest-btn" disabled>向量化并写入 seekdb</button>
+      </div>
+      <div id="ingest-progress" class="progress hidden"><div class="bar"></div></div>
+      <div id="ingest-status" class="status"></div>
+      <div class="row stats-row"><span id="doc-count">seekdb 文档数：-</span></div>
+    </section>
+
+    <section class="card">
+      <h2>③ 混合检索</h2>
+      <div class="row">
+        <input type="text" id="query" placeholder="输入查询，例如：向量数据库如何做混合检索" />
+        <button id="search-btn" disabled>检索</button>
+      </div>
+      <div id="search-status" class="status"></div>
+      <div id="results"></div>
+    </section>
+
+    <section class="card">
+      <h2>④ 性能计时</h2>
+      <table class="timing">
+        <thead><tr><th>阶段</th><th>首次</th><th>最近一次</th></tr></thead>
+        <tbody id="timing-body">
+          <tr><td>模型下载/加载</td><td id="t-load-first">-</td><td id="t-load-last">-</td></tr>
+          <tr><td>文档向量化</td><td id="t-embed-first">-</td><td id="t-embed-last">-</td></tr>
+          <tr><td>写入 + 索引刷新</td><td id="t-ingest-first">-</td><td id="t-ingest-last">-</td></tr>
+          <tr><td>查询向量化</td><td id="t-qembed-first">-</td><td id="t-qembed-last">-</td></tr>
+          <tr><td>seekdb 混合检索</td><td id="t-search-first">-</td><td id="t-search-last">-</td></tr>
+          <tr class="total"><td>端到端（查询→结果）</td><td id="t-e2e-first">-</td><td id="t-e2e-last">-</td></tr>
+        </tbody>
+      </table>
+      <p class="hint">性能数据为浏览器实测，建议重复测量取中位数（技术说明模板见 README）。</p>
+    </section>
+  </main>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

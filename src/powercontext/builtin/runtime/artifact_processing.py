@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -78,6 +83,8 @@ _CONTROL_CONFLICT_RETRY_SECONDS = 0.1
 _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
+# Poll cadence for count-based admission when a count threshold is configured.
+_COUNT_DISCOVERY_SECONDS = 0.25
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
@@ -114,6 +121,10 @@ class ArtifactProcessingBinding:
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
+    # Count-based admission: admit one invocation when the pending Source count
+    # since this family's last successful cursor reaches this threshold. None
+    # keeps the time-based behavior only.
+    source_count_threshold: int | None = None
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
@@ -131,6 +142,10 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold < 1
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -448,6 +463,7 @@ class ArtifactProcessingSupervisor:
         self._intents = intents or ArtifactProcessingIntentRepository()
         self._leases = leases or ArtifactProcessingLeaseRepository()
         self._binding_states = binding_states or ArtifactProcessingBindingStateRepository()
+        self._cursors = SourceCursorRepository()
         self.holder_id = holder_id or str(uuid4())
         self._tick = oceanbase_tick_seconds
         self._lease_seconds = oceanbase_lease_seconds
@@ -656,6 +672,42 @@ class ArtifactProcessingSupervisor:
         else:
             await self._discover_requested(state)
             await self._discover_automatic(state)
+        await self._discover_count(state)
+
+    async def _discover_count(self, state: _FamilyState) -> None:
+        """Admit scopes whose pending Source count reached the configured threshold.
+
+        The count is per scope and per family: journal entries after this
+        family's last successful cursor, read from the durable journal head.
+        Duplicate captures, receipt trust upgrades, and lineage-only server
+        sources occupy journal identities exactly like any other entry. An
+        admitted scope requests one generation — the family worker still
+        consumes one window and the count is re-evaluated afterwards.
+        """
+
+        threshold = state.binding.source_count_threshold
+        if threshold is None:
+            return
+        capacity = self._fresh_capacity(state)
+        if capacity <= 0:
+            return
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        admitted: list[str] = []
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            rows = (await connection.execute(select(heads.c.scope_id, heads.c.position))).all()
+            for scope_value, position in rows:
+                scope_id = str(scope_value)
+                if scope_id in state.queued or scope_id in state.running or scope_id in state.retries:
+                    continue
+                cursor = await self._cursors.load(connection, scope_id, state.binding.binding_name)
+                pending = int(position) - (0 if cursor is None else cursor.cursor.sequence)
+                if pending < threshold:
+                    continue
+                await self._intents.request(connection, scope_id, state.binding.binding_name)
+                admitted.append(scope_id)
+        for scope in admitted:
+            self._enqueue(state, scope)
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
@@ -1080,6 +1132,10 @@ class ArtifactProcessingSupervisor:
             return self._tick
         now = asyncio.get_running_loop().time()
         deadlines: list[float] = []
+        if any(
+            state.binding.source_count_threshold is not None for state in self._families.values()
+        ):
+            deadlines.append(now + _COUNT_DISCOVERY_SECONDS)
         for state in self._families.values():
             if len(state.running) >= state.binding.max_workers:
                 continue

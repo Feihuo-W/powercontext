@@ -1180,6 +1180,33 @@ RECURRENCE_OBSERVATION_TABLE = Table(
 
 RECURRENCE_TABLES = (RECURRENCE_MATCH_TABLE, RECURRENCE_OBSERVATION_TABLE)
 
+
+LIFECYCLE_NODES_TABLE = Table(
+    "pc_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(128), primary_key=True),
+    Column("kind", identity_string(16), nullable=False),
+    Column("policy", identity_string(8), nullable=False, default=""),
+    Column("parents", Text, nullable=False),
+    Column("reference", Text, nullable=False),
+    Column("lifecycle_revision", BigInteger, nullable=False, default=0),
+    Column("available", Boolean, nullable=False),
+)
+
+LIFECYCLE_EVENTS_TABLE = Table(
+    "pc_lifecycle_events",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(128), primary_key=True),
+    Column("sequence", BigInteger, primary_key=True),
+    Column("lifecycle_revision", BigInteger, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("reason", Text, nullable=False),
+)
+
+LIFECYCLE_TABLES = (LIFECYCLE_NODES_TABLE, LIFECYCLE_EVENTS_TABLE)
+
 BUILTIN_TABLES = (
     SCOPE_TABLES
     + SHARED_TABLES
@@ -1187,5 +1214,6 @@ BUILTIN_TABLES = (
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
+    + LIFECYCLE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
 )

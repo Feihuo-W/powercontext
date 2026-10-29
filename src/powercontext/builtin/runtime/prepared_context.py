@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import re
+from collections import Counter
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TypeVar
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,20 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One query-selected literal excerpt of a Memory entry version.
+
+    ``text`` is exactly ``entry.text[start:end]`` of the addressed entry version;
+    the slice is never rewritten, translated, or generated.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -227,6 +244,9 @@ class PreparedContextBuilder:
                 )
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
+
+        if request.evidence_selection:
+            return self._build_fragments(request, current_scope_id, memory_candidates)
 
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
@@ -568,6 +588,65 @@ class PreparedContextBuilder:
             )
         return tuple(experience_entries)
 
+    def _build_fragments(
+        self,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Query-driven literal fragment selection under the full output byte budget.
+
+        Sentences are scored by query-token overlap inside each candidate entry, ranked
+        deterministically, and greedily admitted while the complete rendered output —
+        trust policy, envelope, citations and content — stays within ``max_bytes``.
+        """
+
+        query_tokens = _content_tokens(request.query)
+        ranked = _rank_fragments(memory_candidates, query_tokens)
+        items: list[dict[str, object]] = []
+        fragments: list[PreparedContextFragment] = []
+        origins: list[PreparedContextOrigin] = []
+        accepted_content: str | None = None
+        for fragment, scope_id in ranked:
+            citation = {
+                "scope_id": scope_id,
+                "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                "entry_id": fragment.address.entry_id,
+                "entry_version_id": fragment.address.entry_version_id,
+            }
+            item = {
+                "citation": citation,
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+            envelope = {"trust": "untrusted_history", "items": [*items, item]}
+            encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+            content = "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+            if len(content.encode("utf-8")) > request.max_bytes:
+                continue
+            accepted_content = content
+            items.append(item)
+            fragments.append(fragment)
+            if scope_id == current_scope_id:
+                origins.append(
+                    MemoryCitation(
+                        memory_ref=fragment.address.memory.artifact,
+                        entry_id=fragment.address.entry_id,
+                        entry_version_id=fragment.address.entry_version_id,
+                    )
+                )
+            else:
+                origins.append(fragment.address)
+        if not items or accepted_content is None:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content_bytes = len(accepted_content.encode("utf-8"))
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=accepted_content, content_bytes=content_bytes),
+            origins=tuple(origins),
+            fragments=tuple(fragments),
+        )
+
     def _fit_entries(
         self,
         request: PrepareContextRequest,
@@ -728,3 +807,63 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+_TOKEN_PATTERN = re.compile(r"[a-z]+|\d+|[\u4e00-\u9fff]")
+_SENTENCE_PATTERN = re.compile(r"[^.!?\n。；;]*[.!?\n。；;]+|[^.!?\n。；;]+$")
+
+
+def _content_tokens(text: str) -> Counter[str]:
+    return Counter(_TOKEN_PATTERN.findall(text.casefold()))
+
+
+def _overlap_score(query_tokens: Counter[str], candidate_tokens: Counter[str]) -> int:
+    return sum(min(count, query_tokens[token]) for token, count in candidate_tokens.items() if token in query_tokens)
+
+
+def _entry_sentences(text: str) -> Iterator[tuple[int, int, str]]:
+    """Yield ``(start, end, stripped_text)`` spans of the sentences in one entry."""
+
+    for match in _SENTENCE_PATTERN.finditer(text):
+        start, end = match.span()
+        stripped = text[start:end].strip()
+        if not stripped:
+            continue
+        lead = len(text[start:end]) - len(text[start:end].lstrip())
+        trail = len(text[start:end]) - len(text[start:end].rstrip())
+        yield start + lead, end - trail, stripped
+
+
+def _rank_fragments(
+    memory_candidates: Sequence[PreparedMemoryCandidates],
+    query_tokens: Counter[str],
+    /,
+) -> list[tuple[PreparedContextFragment, str]]:
+    """Rank literal sentence fragments from the Memory candidates by query relevance."""
+
+    ranked: list[tuple[int, int, int, int, PreparedContextFragment, str]] = []
+    for group_index, candidates in enumerate(memory_candidates):
+        if candidates.memory_ref is None:
+            continue
+        seen: set[tuple[str, str]] = set()
+        for hit in candidates.hits:
+            identity = (hit.entry_id, hit.entry_version_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not hit.text.strip():
+                continue
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=candidates.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            for position, (start, end, sentence) in enumerate(_entry_sentences(hit.text)):
+                score = _overlap_score(query_tokens, _content_tokens(sentence))
+                if score <= 0:
+                    continue
+                ranked.append(
+                    (-score, group_index, position, start, PreparedContextFragment(address=address, start=start, end=end, text=sentence), candidates.scope_id)
+                )
+    ranked.sort(key=lambda item: item[:4])
+    return [(fragment, scope_id) for _, _, _, _, fragment, scope_id in ranked]

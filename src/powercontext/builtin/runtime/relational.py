@@ -158,7 +158,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingBindingStateRepository,
     ArtifactProcessingLeaseRepository,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_HEADS_TABLE,
+    LIFECYCLE_NODES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.persistence.topic_memory import TopicMemoryRepository
 from powercontext.builtin.persistence.topic_memory_index import NoTopicMemoryIndex, TopicMemoryIndex
 from powercontext.builtin.persistence.topic_memory_management import TopicMemoryManagementWriter
@@ -506,6 +510,30 @@ class _ScopedServices:
             memory_service=memory_service,
             estimator=self.token_estimator,
         )
+
+
+async def _lifecycle_withdrawn_topics(connection: AsyncConnection, scope_id: str) -> frozenset[str]:
+    """Artifact IDs of Topic Memory nodes whose lifecycle support is withdrawn."""
+
+    try:
+        rows = (
+            await connection.execute(
+                select(LIFECYCLE_NODES_TABLE.c.reference).where(
+                    LIFECYCLE_NODES_TABLE.c.scope_id == scope_id,
+                    LIFECYCLE_NODES_TABLE.c.kind == "topic",
+                    LIFECYCLE_NODES_TABLE.c.available.is_(False),
+                )
+            )
+        ).all()
+    except Exception:  # noqa: BLE001 - the projection is optional for a scope
+        return frozenset()
+    withdrawn: set[str] = set()
+    for row in rows:
+        try:
+            withdrawn.add(str(json.loads(str(row[0]))["artifact_id"]))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return frozenset(withdrawn)
 
 
 class RelationalContexts:
@@ -991,7 +1019,7 @@ class RelationalContexts:
             embedding_profile = query_embedding.embedding_profile
         scope = validate_scope_id(scope_id)
         async with self.database.transaction() as connection:
-            return await self.repositories.topic_memories.search(
+            result = await self.repositories.topic_memories.search(
                 connection,
                 scope,
                 query,
@@ -1001,6 +1029,11 @@ class RelationalContexts:
                 embedding_profile=embedding_profile,
                 admission=admission,
             )
+            withdrawn = await _lifecycle_withdrawn_topics(connection, scope)
+            if not withdrawn:
+                return result
+            hits = tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in withdrawn)
+            return result.model_copy(update={"hits": hits})
 
     async def search_skills(
         self,
